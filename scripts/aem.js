@@ -1,3 +1,4 @@
+/* eslint-disable max-classes-per-file */
 /*
  * Copyright 2024 Adobe. All rights reserved.
  * This file is licensed to you under the Apache License, Version 2.0 (the "License");
@@ -91,36 +92,6 @@ function sampleRUM(checkpoint, data) {
   } catch (error) {
     // something went wrong
   }
-}
-
-/**
- * Setup block utils.
- */
-function setup() {
-  window.hlx = window.hlx || {};
-  window.hlx.RUM_MASK_URL = 'full';
-  window.hlx.RUM_MANUAL_ENHANCE = true;
-  window.hlx.codeBasePath = '';
-  window.hlx.lighthouse = new URLSearchParams(window.location.search).get('lighthouse') === 'on';
-
-  const scriptEl = document.querySelector('script[src$="/scripts/scripts.js"]');
-  if (scriptEl) {
-    try {
-      [window.hlx.codeBasePath] = new URL(scriptEl.src).pathname.split('/scripts/scripts.js');
-    } catch (error) {
-      // eslint-disable-next-line no-console
-      console.log(error);
-    }
-  }
-}
-
-/**
- * Auto initializiation.
- */
-
-function init() {
-  setup();
-  sampleRUM();
 }
 
 /**
@@ -532,6 +503,53 @@ function buildBlock(blockName, content) {
 }
 
 /**
+ * Dispatches a custom DOM event and awaits all listeners before returning.
+ * @param {String} eventName The custom event to trigger
+ * @param {Object} [detail] Optional detail object to pass to the event
+ * @returns a promise that all async listeners have run
+ */
+async function dispatchAsyncEvent(eventName, detail = {}) {
+  const promises = [];
+  const event = new CustomEvent(eventName, { detail });
+  event.await = (p) => promises.push(p);
+  document.dispatchEvent(event);
+  return Promise.all(promises);
+}
+
+/**
+ * Loads the specified module with its JS and CSS files and returns the JS API if applicable.
+ * @param {String} name The module name
+ * @param {String} cssPath A path to the CSS file to load, or null
+ * @param {String} jsPath A path to the JS file to load, or null
+ * @param {...any} args Arguments to use to call the default export on the JS file
+ * @returns a promsie that the module was loaded, and that returns the JS API is any
+ */
+async function loadModule({
+  name, cssPath, jsPath, el,
+}) {
+  const cssLoaded = cssPath ? loadCSS(cssPath) : Promise.resolve();
+  const decorationComplete = jsPath
+    ? new Promise((resolve) => {
+      (async () => {
+        let mod;
+        try {
+          mod = await import(jsPath);
+          if (mod.default) {
+            await mod.default(el);
+          }
+        } catch (error) {
+          // eslint-disable-next-line no-console
+          console.log(`failed to load module for ${name}`, error);
+        }
+        resolve(mod);
+      })();
+    })
+    : Promise.resolve();
+  return Promise.all([cssLoaded, decorationComplete])
+    .then(([, api]) => api);
+}
+
+/**
  * Loads JS and CSS for a block.
  * @param {Element} block The block element
  */
@@ -541,29 +559,25 @@ async function loadBlock(block) {
     block.dataset.blockStatus = 'loading';
     const { blockName } = block.dataset;
     try {
-      const cssLoaded = loadCSS(`${window.hlx.codeBasePath}/blocks/${blockName}/${blockName}.css`);
-      const decorationComplete = new Promise((resolve) => {
-        (async () => {
-          try {
-            const mod = await import(
-              `${window.hlx.codeBasePath}/blocks/${blockName}/${blockName}.js`
-            );
-            if (mod.default) {
-              await mod.default(block);
-            }
-          } catch (error) {
-            // eslint-disable-next-line no-console
-            console.log(`failed to load module for ${blockName}`, error);
-          }
-          resolve();
-        })();
+      const cssPath = `${window.hlx.codeBasePath}/blocks/${blockName}/${blockName}.css`;
+      const jsPath = `${window.hlx.codeBasePath}/blocks/${blockName}/${blockName}.js`;
+      const config = {
+        block,
+        blockName,
+        cssPath,
+        jsPath,
+      };
+      await dispatchAsyncEvent('aem:block:config', config);
+      await loadModule({
+        name: blockName, cssPath, jsPath, el: block,
       });
-      await Promise.all([cssLoaded, decorationComplete]);
+      await dispatchAsyncEvent('aem:blockdecorated', { name: blockName, block });
     } catch (error) {
       // eslint-disable-next-line no-console
       console.log(`failed to load block ${blockName}`, error);
     }
     block.dataset.blockStatus = 'loaded';
+    await dispatchAsyncEvent('aem:block:loaded', { name: blockName, block });
   }
   return block;
 }
@@ -652,6 +666,7 @@ async function loadSection(section, loadCallback) {
     if (loadCallback) await loadCallback(section);
     section.dataset.sectionStatus = 'loaded';
     section.style.display = null;
+    dispatchAsyncEvent('aem:section:loaded', { section });
   }
 }
 
@@ -668,7 +683,126 @@ async function loadSections(element) {
   }
 }
 
+/**
+ * Parses the plugin id and config paramters and returns a proper config
+ *
+ * @param {String} id A string that idenfies the plugin, or a path to it
+ * @param {String|Object} [config] A string representing the path to the plugin, or a config object
+ * @returns an object returning the the plugin id and its config
+ */
+function parsePluginParams(id, config) {
+  const pluginId = !config
+    ? id.split('/').splice(id.endsWith('/') ? -2 : -1, 1)[0].replace(/\.js/, '')
+    : id;
+  const pluginConfig = typeof config === 'string' || !config
+    ? { load: 'lazy', url: (config || id).replace(/\/$/, '') }
+    : { load: config.eager ? 'eager' : 'lazy', ...config };
+  pluginConfig.options ||= {};
+  return { id: toClassName(pluginId), config: pluginConfig };
+}
+
+class PluginsRegistry {
+  #plugins;
+
+  constructor() {
+    this.#plugins = new Map();
+  }
+
+  // Register a new plugin
+  add(id, config) {
+    const { id: pluginId, config: plugin } = parsePluginParams(id, config);
+    this.#plugins.set(pluginId, plugin);
+    document.addEventListener(`aem:${plugin.load}`, (ev) => {
+      if (plugin.condition && !plugin.condition(document, plugin.options)) {
+        return;
+      }
+      if (plugin.url) {
+        const isJsUrl = plugin.url.endsWith('.js');
+        const loadPromise = loadModule({
+          name: pluginId,
+          cssPath: !isJsUrl ? `${plugin.url}/${pluginId}.css` : null,
+          jsPath: !isJsUrl ? `${plugin.url}/${pluginId}.js` : plugin.url,
+          el: document,
+        }).then((api = {}) => {
+          this.#plugins.set(pluginId, { ...plugin, ...api });
+        });
+        ev.await(loadPromise);
+      } else if (plugin.run) {
+        plugin.run(document, plugin.options);
+      }
+      ['eager', 'lazy', 'delayed'].forEach((phase) => {
+        if (plugin[phase] && ev.type !== `aem:${phase}`) {
+          document.addEventListener(`aem:${phase}`, () => plugin[phase](document, plugin.options), { once: true });
+        } else if (plugin[phase] && ev.type === `aem:${phase}`) {
+          plugin[phase](document, plugin.options);
+        }
+      });
+    }, { once: true });
+  }
+
+  // Get the plugin
+  get(id) { return this.#plugins.get(id); }
+
+  // Check if the plugin exists
+  has(id) { return !!this.#plugins.has(id); }
+}
+
+class TemplatesRegistry {
+  // Register a new template
+  // eslint-disable-next-line class-methods-use-this
+  add(id, url) {
+    const { id: templateId, config: templateConfig } = parsePluginParams(id, url);
+    window.hlx.plugins.add(templateId, {
+      ...templateConfig,
+      condition: () => toClassName(getMetadata('template')) === templateId,
+      load: 'eager',
+    });
+  }
+
+  // Get the template
+  // eslint-disable-next-line class-methods-use-this
+  get(id) { return window.hlx.plugins.get(id); }
+
+  // Check if the template exists
+  // eslint-disable-next-line class-methods-use-this
+  has(id) { return window.hlx.plugins.includes(id); }
+}
+
+/**
+ * Setup block utils.
+ */
+function setup() {
+  window.hlx = window.hlx || {};
+  window.hlx.RUM_MASK_URL = 'full';
+  window.hlx.RUM_MANUAL_ENHANCE = true;
+  window.hlx.codeBasePath = '';
+  window.hlx.lighthouse = new URLSearchParams(window.location.search).get('lighthouse') === 'on';
+  window.hlx.plugins = new PluginsRegistry();
+  window.hlx.templates = new TemplatesRegistry();
+
+  const scriptEl = document.querySelector('script[src$="/scripts/scripts.js"]');
+  if (scriptEl) {
+    try {
+      [window.hlx.codeBasePath] = new URL(scriptEl.src).pathname.split('/scripts/scripts.js');
+    } catch (error) {
+      // eslint-disable-next-line no-console
+      console.log(error);
+    }
+  }
+}
+
+/**
+ * Auto initializiation.
+ */
+async function init() {
+  setup();
+  sampleRUM();
+}
+
 init();
+
+const withPlugin = window.hlx.plugins.add.bind(window.hlx.plugins);
+const withTemplate = window.hlx.templates.add.bind(window.hlx.templates);
 
 export {
   buildBlock,
@@ -695,4 +829,7 @@ export {
   toClassName,
   waitForFirstImage,
   wrapTextNodes,
+  withPlugin,
+  withTemplate,
+  dispatchAsyncEvent,
 };

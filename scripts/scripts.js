@@ -12,6 +12,7 @@ import {
   loadSections,
   loadCSS,
   sampleRUM,
+  dispatchAsyncEvent,
 } from './aem.js';
 
 /**
@@ -119,12 +120,17 @@ async function loadLazy(doc) {
  */
 function loadDelayed() {
   // eslint-disable-next-line import/no-cycle
-  window.setTimeout(() => import('./delayed.js'), 3000);
+  window.setTimeout(async () => {
+    await dispatchAsyncEvent('aem:lazy');
+    import('./delayed.js');
+  }, 3000);
   // load anything that can be postponed to the latest here
 }
 
 async function loadPage() {
+  await dispatchAsyncEvent('aem:eager');
   await loadEager(document);
+  await dispatchAsyncEvent('aem:lazy');
   await loadLazy(document);
   loadDelayed();
 }
